@@ -1,0 +1,111 @@
+name: Sync AnyXboxX
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,37 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-anyxboxx-continuation
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'adanp283-bs/AnyXboxX' && github.ref == 'refs/heads/sync-control'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: anyxboxx-sync
+      deployment: false
+    steps:
+      - name: Sync and verify AnyXboxX
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANYXBOXX_SYNC_KEY: ${{ secrets.ANYXBOXX_SYNC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_TERMINAL_PROMPT=0
+          upstream=LooperSalty/AnyXboxX
+          expected_upstream_id=1466028817
+          source_branch=main
+          target_branch=main
+          upstream_id=$(gh api "repos/$upstream" --jq '.id')
+          if [[ "$upstream_id" != "$expected_upstream_id" ]]; then
+            echo "Unexpected upstream repository ID: $upstream_id; expected $expected_upstream_id" >&2
+            exit 1
+          fi
+          : "${ANYXBOXX_SYNC_KEY:?Configure the protected anyxboxx-sync environment and ANYXBOXX_SYNC_KEY first}"
+          upstream_sha=$(gh api "repos/$upstream/git/ref/heads/$source_branch" --jq '.object.sha')
+          fork_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/$target_branch" --jq ".[] | select(.ref == \"refs/heads/$target_branch\") | .object.sha")
+
+          if [[ "$upstream_sha" == "$fork_sha" ]]; then
+            echo "$target_branch is up to date with $upstream/$source_branch at $fork_sha"
+            printf '`%s` is up to date with `%s/%s` at `%s`.\n' "$target_branch" "$upstream" "$source_branch" "$fork_sha" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          umask 077
+          sync_dir=$(mktemp -d "$RUNNER_TEMP/anyxboxx-sync.XXXXXX")
+          trap 'rm -rf -- "$sync_dir"' EXIT
+          printf '%s\n' "$ANYXBOXX_SYNC_KEY" > "$sync_dir/key"
+          unset ANYXBOXX_SYNC_KEY
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$sync_dir/known_hosts"
+          test -s "$sync_dir/known_hosts"
+          printf -v GIT_SSH_COMMAND 'ssh -i %q -o UserKnownHostsFile=%q -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20' "$sync_dir/key" "$sync_dir/known_hosts"
+          export GIT_SSH_COMMAND
+
+          git init --bare "$sync_dir/repo.git"
+          cd "$sync_dir/repo.git"
+          git remote add upstream "https://github.com/$upstream.git"
+          git remote add origin "git@github.com:$GITHUB_REPOSITORY.git"
+          git fetch --no-tags upstream "refs/heads/$source_branch:refs/remotes/upstream/$source_branch"
+          existing_ref=$(git ls-remote origin "refs/heads/$target_branch")
+          if [[ -n "$existing_ref" ]]; then
+            git fetch --no-tags origin "refs/heads/$target_branch:refs/remotes/origin/$target_branch"
+            fork_sha=$(git rev-parse "refs/remotes/origin/$target_branch")
+            if ! git merge-base --is-ancestor "$fork_sha" "refs/remotes/upstream/$source_branch"; then
+              echo "$target_branch has independent commits; refusing to overwrite $fork_sha" >&2
+              exit 1
+            fi
+          else
+            fork_sha='(new branch)'
+          fi
+          target_sha=$(git rev-parse "refs/remotes/upstream/$source_branch")
+          git push origin "refs/remotes/upstream/$source_branch:refs/heads/$target_branch"
+
+          actual_sha=$(git ls-remote origin "refs/heads/$target_branch" | cut -f1)
+          [[ "$actual_sha" == "$target_sha" ]]
+          echo "Synced $upstream/$source_branch to $target_branch from $fork_sha to $actual_sha"
+          printf 'Synced `%s/%s` to `%s` from `%s` to `%s`.\n' "$upstream" "$source_branch" "$target_branch" "$fork_sha" "$actual_sha" >> "$GITHUB_STEP_SUMMARY"
+
+  queue_next:
+    name: Schedule next sync
+    needs: sync
+    if: always() && !cancelled() && github.repository == 'adanp283-bs/AnyXboxX' && github.ref == 'refs/heads/sync-control'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    environment:
+      name: anyxboxx-sync-interval
+      deployment: false
+    steps:
+      - name: Queue the next sync after the protected five-minute wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/sync-anyxboxx.yml/dispatches" -f ref=sync-control; then
+              printf 'Automatically queued the next sync on `sync-control` after the five-minute environment wait.\n' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [[ "$attempt" -lt 3 ]]; then sleep 5; fi
+          done
+          echo 'Could not queue the next sync after three attempts' >&2
+          exit 1
